@@ -1,0 +1,5 @@
+db:
+  host: "localhost"
+  user: "root"
+  password: "290807" 
+  database: "fablab_db"
