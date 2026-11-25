@@ -1,8 +1,12 @@
-CREATE DATABASE IF NOT EXISTS fablab_db;
+CREATE DATABASE IF NOT EXISTS fablab_db
+    CHARACTER SET utf8mb4
+    COLLATE utf8mb4_unicode_ci;
 USE fablab_db;
 
 SET FOREIGN_KEY_CHECKS = 0;
 
+DROP TABLE IF EXISTS rentals_delete_log;
+DROP TABLE IF EXISTS equipment_notes;
 DROP TABLE IF EXISTS kit_items;
 DROP TABLE IF EXISTS machine_sessions;
 DROP TABLE IF EXISTS repairs;
@@ -112,9 +116,27 @@ CREATE TABLE machine_sessions (
     CONSTRAINT fk_sessions_user FOREIGN KEY (user_id) REFERENCES users(id)
 ) ENGINE = InnoDB;
 
+CREATE TABLE equipment_notes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    equipment_id INT NOT NULL,
+    note_text VARCHAR(255) NOT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE = InnoDB;
+
+CREATE TABLE rentals_delete_log (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    rental_id INT NOT NULL,
+    user_id INT NOT NULL,
+    equipment_id INT NOT NULL,
+    checkout_time DATETIME NOT NULL,
+    return_time DATETIME,
+    deleted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE = InnoDB;
+
 CREATE UNIQUE INDEX idx_users_email ON users(email);
 CREATE UNIQUE INDEX idx_equipment_inventory ON equipment(inventory_number);
 CREATE INDEX idx_rentals_checkout ON rentals(checkout_time);
+CREATE INDEX idx_equipment_notes_equipment_id ON equipment_notes(equipment_id);
 
 INSERT INTO users (first_name, last_name, email, phone) VALUES
 ('Олександр', 'Іванов', 'o.ivanov@mail.com', '+380501112233'),
@@ -235,7 +257,7 @@ INSERT INTO rentals (checkout_time, return_time, user_id, equipment_id, project_
 ('2023-10-08 08:45:00', '2023-10-08 17:00:00', 8, 7, 6, 4),
 ('2023-10-09 11:00:00', '2023-10-10 11:00:00', 9, 1, 3, 2),
 ('2023-10-10 13:20:00', NULL, 10, 2, 8, 6),
-('2023-10-11 09:30:00', NULL, 1, 3, 7, 2); 
+('2023-10-11 09:30:00', NULL, 1, 3, 7, 2);
 
 INSERT INTO repairs (issue_description, start_date, end_date, equipment_id) VALUES
 ('Забилося сопло', '2023-09-01', '2023-09-02', 1),
@@ -261,15 +283,283 @@ INSERT INTO machine_sessions (session_start, duration_minutes, equipment_id, use
 ('2023-10-09 15:45:00', 60, 1, 1),
 ('2023-10-10 09:30:00', 210, 2, 2);
 
-SELECT * FROM users;
-SELECT * FROM projects;
-SELECT * FROM labs;
-SELECT * FROM equipment_categories;
-SELECT * FROM equipment_statuses;
-SELECT * FROM equipment_info;
-SELECT * FROM equipment_kits;
-SELECT * FROM equipment;
-SELECT * FROM kit_items;
-SELECT * FROM rentals;
-SELECT * FROM repairs;
-SELECT * FROM machine_sessions;
+INSERT INTO equipment_notes (equipment_id, note_text, created_at) VALUES
+(1, 'Необхідно перевірити натяг ременя осі X після 100 годин друку.', '2023-10-01 15:00:00'),
+(1, 'Встановлено нове сопло діаметром 0.4 мм.', '2023-10-05 09:30:00'),
+(2, 'Замінено жало паяльника на тонке T18-B.', '2023-10-03 12:15:00'),
+(3, 'Пройшов щорічну перевірку калібрування.', '2023-10-06 14:00:00'),
+(6, 'Очищено лінзу та перевірено потік води в системі охолодження.', '2023-10-08 11:20:00');
+
+DELIMITER //
+
+CREATE TRIGGER trg_err_users_before_insert
+BEFORE INSERT ON users
+FOR EACH ROW
+BEGIN
+    DECLARE err_user_validation CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.first_name, '')) = '' OR TRIM(IFNULL(NEW.last_name, '')) = '' THEN
+        SIGNAL err_user_validation
+            SET MYSQL_ERRNO = 20002,
+                MESSAGE_TEXT = 'SQL Error [20002]: Ім\'я та прізвище користувача не можуть бути порожніми';
+    END IF;
+
+    IF NEW.email NOT REGEXP '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$' THEN
+        SIGNAL err_user_validation
+            SET MYSQL_ERRNO = 20001,
+                MESSAGE_TEXT = 'SQL Error [20001]: Некоректний формат email користувача';
+    END IF;
+
+    IF NEW.phone IS NOT NULL AND TRIM(NEW.phone) <> ''
+       AND NEW.phone NOT REGEXP '^\\+?[0-9\\-\\s()]{7,20}$' THEN
+        SIGNAL err_user_validation
+            SET MYSQL_ERRNO = 20003,
+                MESSAGE_TEXT = 'SQL Error [20003]: Некоректний формат номера телефону';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_users_before_update
+BEFORE UPDATE ON users
+FOR EACH ROW
+BEGIN
+    DECLARE err_user_validation CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.first_name, '')) = '' OR TRIM(IFNULL(NEW.last_name, '')) = '' THEN
+        SIGNAL err_user_validation
+            SET MYSQL_ERRNO = 20002,
+                MESSAGE_TEXT = 'SQL Error [20002]: Ім\'я та прізвище користувача не можуть бути порожніми';
+    END IF;
+
+    IF NEW.email NOT REGEXP '^[^[:space:]@]+@[^[:space:]@]+\\.[^[:space:]@]+$' THEN
+        SIGNAL err_user_validation
+            SET MYSQL_ERRNO = 20001,
+                MESSAGE_TEXT = 'SQL Error [20001]: Некоректний формат email користувача';
+    END IF;
+
+    IF NEW.phone IS NOT NULL AND TRIM(NEW.phone) <> ''
+       AND NEW.phone NOT REGEXP '^\\+?[0-9\\-\\s()]{7,20}$' THEN
+        SIGNAL err_user_validation
+            SET MYSQL_ERRNO = 20003,
+                MESSAGE_TEXT = 'SQL Error [20003]: Некоректний формат номера телефону';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_rentals_before_insert
+BEFORE INSERT ON rentals
+FOR EACH ROW
+BEGIN
+    DECLARE err_rental_dates CONDITION FOR SQLSTATE '45000';
+
+    IF NEW.return_time IS NOT NULL AND NEW.return_time < NEW.checkout_time THEN
+        SIGNAL err_rental_dates
+            SET MYSQL_ERRNO = 20004,
+                MESSAGE_TEXT = 'SQL Error [20004]: return_time не може бути раніше checkout_time';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_rentals_before_update
+BEFORE UPDATE ON rentals
+FOR EACH ROW
+BEGIN
+    DECLARE err_rental_dates CONDITION FOR SQLSTATE '45000';
+
+    IF NEW.return_time IS NOT NULL AND NEW.return_time < NEW.checkout_time THEN
+        SIGNAL err_rental_dates
+            SET MYSQL_ERRNO = 20004,
+                MESSAGE_TEXT = 'SQL Error [20004]: return_time не може бути раніше checkout_time';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_repairs_before_insert
+BEFORE INSERT ON repairs
+FOR EACH ROW
+BEGIN
+    DECLARE err_repair_validation CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.issue_description, '')) = '' THEN
+        SIGNAL err_repair_validation
+            SET MYSQL_ERRNO = 20006,
+                MESSAGE_TEXT = 'SQL Error [20006]: Опис несправності не може бути порожнім';
+    END IF;
+
+    IF NEW.end_date IS NOT NULL AND NEW.end_date < NEW.start_date THEN
+        SIGNAL err_repair_validation
+            SET MYSQL_ERRNO = 20005,
+                MESSAGE_TEXT = 'SQL Error [20005]: end_date ремонту не може бути раніше start_date';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_repairs_before_update
+BEFORE UPDATE ON repairs
+FOR EACH ROW
+BEGIN
+    DECLARE err_repair_validation CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.issue_description, '')) = '' THEN
+        SIGNAL err_repair_validation
+            SET MYSQL_ERRNO = 20006,
+                MESSAGE_TEXT = 'SQL Error [20006]: Опис несправності не може бути порожнім';
+    END IF;
+
+    IF NEW.end_date IS NOT NULL AND NEW.end_date < NEW.start_date THEN
+        SIGNAL err_repair_validation
+            SET MYSQL_ERRNO = 20005,
+                MESSAGE_TEXT = 'SQL Error [20005]: end_date ремонту не може бути раніше start_date';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_machine_sessions_before_insert
+BEFORE INSERT ON machine_sessions
+FOR EACH ROW
+BEGIN
+    DECLARE err_session_duration CONDITION FOR SQLSTATE '45000';
+
+    IF NEW.duration_minutes <= 0 THEN
+        SIGNAL err_session_duration
+            SET MYSQL_ERRNO = 20007,
+                MESSAGE_TEXT = 'SQL Error [20007]: Тривалість сесії має бути більшою за 0 хвилин';
+    END IF;
+
+    IF NEW.duration_minutes > 1440 THEN
+        SIGNAL err_session_duration
+            SET MYSQL_ERRNO = 20008,
+                MESSAGE_TEXT = 'SQL Error [20008]: Тривалість сесії не може перевищувати 1440 хвилин';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_machine_sessions_before_update
+BEFORE UPDATE ON machine_sessions
+FOR EACH ROW
+BEGIN
+    DECLARE err_session_duration CONDITION FOR SQLSTATE '45000';
+
+    IF NEW.duration_minutes <= 0 THEN
+        SIGNAL err_session_duration
+            SET MYSQL_ERRNO = 20007,
+                MESSAGE_TEXT = 'SQL Error [20007]: Тривалість сесії має бути більшою за 0 хвилин';
+    END IF;
+
+    IF NEW.duration_minutes > 1440 THEN
+        SIGNAL err_session_duration
+            SET MYSQL_ERRNO = 20008,
+                MESSAGE_TEXT = 'SQL Error [20008]: Тривалість сесії не може перевищувати 1440 хвилин';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_equipment_before_insert
+BEFORE INSERT ON equipment
+FOR EACH ROW
+BEGIN
+    DECLARE err_equipment_validation CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.inventory_number, '')) = '' OR TRIM(IFNULL(NEW.name, '')) = '' THEN
+        SIGNAL err_equipment_validation
+            SET MYSQL_ERRNO = 20009,
+                MESSAGE_TEXT = 'SQL Error [20009]: Інвентарний номер і назва обладнання обов\'язкові';
+    END IF;
+
+    IF NEW.inventory_number NOT REGEXP '^[A-Za-z0-9-]+$' THEN
+        SIGNAL err_equipment_validation
+            SET MYSQL_ERRNO = 20010,
+                MESSAGE_TEXT = 'SQL Error [20010]: Інвентарний номер може містити лише латиницю, цифри та дефіс';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_equipment_before_update
+BEFORE UPDATE ON equipment
+FOR EACH ROW
+BEGIN
+    DECLARE err_equipment_validation CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.inventory_number, '')) = '' OR TRIM(IFNULL(NEW.name, '')) = '' THEN
+        SIGNAL err_equipment_validation
+            SET MYSQL_ERRNO = 20009,
+                MESSAGE_TEXT = 'SQL Error [20009]: Інвентарний номер і назва обладнання обов\'язкові';
+    END IF;
+
+    IF NEW.inventory_number NOT REGEXP '^[A-Za-z0-9-]+$' THEN
+        SIGNAL err_equipment_validation
+            SET MYSQL_ERRNO = 20010,
+                MESSAGE_TEXT = 'SQL Error [20010]: Інвентарний номер може містити лише латиницю, цифри та дефіс';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_projects_before_insert
+BEFORE INSERT ON projects
+FOR EACH ROW
+BEGIN
+    DECLARE err_project_title CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.title, '')) = '' THEN
+        SIGNAL err_project_title
+            SET MYSQL_ERRNO = 20011,
+                MESSAGE_TEXT = 'SQL Error [20011]: Назва проєкту (title) не може бути порожньою';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_projects_before_update
+BEFORE UPDATE ON projects
+FOR EACH ROW
+BEGIN
+    DECLARE err_project_title CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.title, '')) = '' THEN
+        SIGNAL err_project_title
+            SET MYSQL_ERRNO = 20011,
+                MESSAGE_TEXT = 'SQL Error [20011]: Назва проєкту (title) не може бути порожньою';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_labs_before_insert
+BEFORE INSERT ON labs
+FOR EACH ROW
+BEGIN
+    DECLARE err_lab_fields CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.lab_name, '')) = '' OR TRIM(IFNULL(NEW.course_name, '')) = '' THEN
+        SIGNAL err_lab_fields
+            SET MYSQL_ERRNO = 20012,
+                MESSAGE_TEXT = 'SQL Error [20012]: Назва лабораторії та курсу не можуть бути порожніми';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_labs_before_update
+BEFORE UPDATE ON labs
+FOR EACH ROW
+BEGIN
+    DECLARE err_lab_fields CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.lab_name, '')) = '' OR TRIM(IFNULL(NEW.course_name, '')) = '' THEN
+        SIGNAL err_lab_fields
+            SET MYSQL_ERRNO = 20012,
+                MESSAGE_TEXT = 'SQL Error [20012]: Назва лабораторії та курсу не можуть бути порожніми';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_equipment_notes_text_before_insert
+BEFORE INSERT ON equipment_notes
+FOR EACH ROW
+BEGIN
+    DECLARE err_note_text CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.note_text, '')) = '' THEN
+        SIGNAL err_note_text
+            SET MYSQL_ERRNO = 20013,
+                MESSAGE_TEXT = 'SQL Error [20013]: Текст нотатки (note_text) не може бути порожнім';
+    END IF;
+END //
+
+CREATE TRIGGER trg_err_equipment_notes_text_before_update
+BEFORE UPDATE ON equipment_notes
+FOR EACH ROW
+BEGIN
+    DECLARE err_note_text CONDITION FOR SQLSTATE '45000';
+
+    IF TRIM(IFNULL(NEW.note_text, '')) = '' THEN
+        SIGNAL err_note_text
+            SET MYSQL_ERRNO = 20013,
+                MESSAGE_TEXT = 'SQL Error [20013]: Текст нотатки (note_text) не може бути порожнім';
+    END IF;
+END //
+
+DELIMITER ;
